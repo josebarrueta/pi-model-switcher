@@ -9,10 +9,15 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import switcher, { isRateLimit } from "../src/index.ts";
 
+type Reply = "429" | "ok" | "500" | "aborted" | "tool" | {
+  error: string;
+  status?: number;
+};
+
 // Real Pi agent loop, fake model transport: no provider requests or personal credentials.
-async function harness(replies: ("429" | "ok" | "500" | "aborted" | "tool")[], count = 3) {
+async function harness(replies: Reply[], count = 3, onFirstRequest?: (runtime: ModelRuntime) => Promise<void>) {
   const dir = await mkdtemp(join(tmpdir(), "pi-model-switcher-test-"));
-  const runtime = await ModelRuntime.create({ authPath: join(dir, "auth.json"), modelsPath: null, modelsStorePath: join(dir, "models.json") });
+  const runtime = await ModelRuntime.create({ authPath: join(dir, "auth.json"), modelsPath: null, modelsStorePath: join(dir, "models.json"), allowModelNetwork: false });
   await runtime.setRuntimeApiKey("openai", "test-not-a-real-key");
   await runtime.setRuntimeApiKey("anthropic", "test-not-a-real-key");
   const openai = runtime.getModels("openai").slice(0, 2);
@@ -49,11 +54,20 @@ async function harness(replies: ("429" | "ok" | "500" | "aborted" | "tool")[], c
   const calls: string[] = [];
   const contexts: Context[] = [];
   const errors: unknown[] = [];
-  session.agent.streamFunction = (model, context) => {
+  const unexpectedRequests: string[] = [];
+  session.agent.streamFunction = async (model, context, options) => {
     calls.push(`${model.provider}/${model.id}`);
     contexts.push(structuredClone(context));
     assert.ok(calls.length <= 12, "failover loop exceeded the eligible model count");
-    const reply = replies.shift() ?? "500";
+    if (calls.length === 1) await onFirstRequest?.(runtime);
+    const fixture = replies.shift();
+    if (fixture === undefined) unexpectedRequests.push(`${model.provider}/${model.id}`);
+    const reply = fixture ?? "500";
+    if (typeof reply === "object" && reply.status !== undefined) {
+      // Exercise Pi's real after_provider_response hook, not just the classifier.
+      assert.ok(options?.onResponse, "Pi must wire provider response metadata");
+      await options.onResponse({ status: reply.status, headers: {} }, model);
+    }
     const stream = createAssistantMessageEventStream();
     const message: AssistantMessage = {
       role: "assistant", content: reply === "tool"
@@ -62,7 +76,10 @@ async function harness(replies: ("429" | "ok" | "500" | "aborted" | "tool")[], c
       provider: model.provider, api: model.api, model: model.id,
       usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
       stopReason: reply === "tool" ? "toolUse" : reply === "ok" ? "stop" : reply === "aborted" ? "aborted" : "error",
-      ...(reply !== "ok" && reply !== "tool" ? { errorMessage: reply === "429" ? "429 Too Many Requests" : "500 Internal Server Error" } : {}),
+      ...(reply !== "ok" && reply !== "tool" ? {
+        errorMessage: typeof reply === "object" ? reply.error
+          : reply === "429" ? "429 Too Many Requests" : "500 Internal Server Error",
+      } : {}),
       timestamp: Date.now(),
     };
     if (message.stopReason === "error" || message.stopReason === "aborted") {
@@ -76,7 +93,13 @@ async function harness(replies: ("429" | "ok" | "500" | "aborted" | "tool")[], c
   await session.bindExtensions({ onError: error => errors.push(error) });
   return {
     session, calls, contexts, errors, models, effects,
-    async close() { session.dispose(); await rm(dir, { recursive: true, force: true }); },
+    async close() {
+      session.dispose();
+      await rm(dir, { recursive: true, force: true });
+      assert.deepEqual(errors, [], "Pi extension handlers must not fail silently");
+      assert.deepEqual(unexpectedRequests, [], "every provider request must have an explicit response fixture");
+      assert.equal(replies.length, 0, "all expected response fixtures must be consumed");
+    },
   };
 }
 
@@ -102,6 +125,39 @@ test("429 switches provider and continues original prompt without failed respons
     assert.ok(h.session.sessionManager.getBranch().some(e => e.type === "custom" && e.customType === "model-switcher.failover"));
   } finally { await h.close(); }
 });
+
+test("HTTP 429 metadata triggers failover even without a recognizable error body", async () => {
+  const h = await harness([{ status: 429, error: "Provider rejected the request" }, "ok"]);
+  try {
+    await h.session.prompt("Continue the task");
+    assert.equal(h.calls.length, 2);
+    assert.equal(h.session.getLastAssistantText(), "Done");
+    assert.deepEqual(h.errors, []);
+  } finally { await h.close(); }
+});
+
+test("an in-stream rate-limit error after HTTP 200 still switches models", async () => {
+  const h = await harness([{ status: 200, error: "rate_limit_error: please retry later" }, "ok"]);
+  try {
+    await h.session.prompt("Continue the task");
+    assert.equal(h.calls.length, 2);
+    assert.equal(h.session.getLastAssistantText(), "Done");
+    assert.deepEqual(h.errors, []);
+  } finally { await h.close(); }
+});
+
+for (const status of [400, 401, 403, 500, 503]) {
+  test(`HTTP ${status} is not retried even if the body quotes an earlier 429`, async () => {
+    const h = await harness([{ status, error: "Request failed; previous error: 429" }]);
+    try {
+      await h.session.prompt("Do work");
+      assert.equal(h.calls.length, 1);
+      const stop = h.session.sessionManager.getBranch().find(e => e.type === "custom" && e.customType === "model-switcher.stop");
+      assert.ok(stop && stop.type === "custom");
+      assert.match((stop.data as { reason: string }).reason, /non-rate-limit/);
+    } finally { await h.close(); }
+  });
+}
 
 test("exhaustion tries each eligible model once even with native retries enabled", async () => {
   const h = await harness(["429", "429", "429"]);
@@ -129,6 +185,17 @@ test("completed tool actions survive failover without being replayed", async () 
   } finally { await h.close(); }
 });
 
+test("remaining models from the same provider are tried before stopping", async () => {
+  const h = await harness(["429", "ok"], 2);
+  try {
+    await h.session.prompt("Do work");
+    assert.equal(h.calls.length, 2);
+    assert.ok(h.calls.every(id => id.startsWith("openai/")));
+    assert.notEqual(h.calls[0], h.calls[1]);
+    assert.equal(h.session.getLastAssistantText(), "Done");
+  } finally { await h.close(); }
+});
+
 test("one eligible model stops on its first 429", async () => {
   const h = await harness(["429"], 1);
   try { await h.session.prompt("Do work"); assert.equal(h.calls.length, 1); }
@@ -141,10 +208,33 @@ test("non-429 errors do not trigger failover or native retries", async () => {
   finally { await h.close(); }
 });
 
+test("credentials disappearing after the task snapshot stop failover safely", async () => {
+  const h = await harness(["429"], 3, runtime => runtime.removeRuntimeApiKey("anthropic"));
+  try {
+    await h.session.prompt("Do work");
+    assert.equal(h.calls.length, 1);
+    const stops = h.session.sessionManager.getBranch().filter(e => e.type === "custom" && e.customType === "model-switcher.stop");
+    assert.equal(stops.length, 1);
+    assert.ok(stops[0].type === "custom");
+    assert.match((stops[0].data as { reason: string }).reason, /credentials unavailable/);
+    assert.deepEqual(h.errors, []);
+  } finally { await h.close(); }
+});
+
 test("aborted requests do not switch models", async () => {
   const h = await harness(["aborted"]);
   try { await h.session.prompt("Do work"); assert.equal(h.calls.length, 1); }
   finally { await h.close(); }
+});
+
+test("user cancellation wins over a late rate-limit response", async () => {
+  const h = await harness(["429"], 3, async () => { void h.session.abort(); });
+  try {
+    await h.session.prompt("Do work");
+    assert.equal(h.calls.length, 1);
+    assert.equal(h.session.sessionManager.getBranch().filter(e => e.type === "custom" && e.customType === "model-switcher.failover").length, 0);
+    assert.deepEqual(h.errors, []);
+  } finally { await h.close(); }
 });
 
 test("a fresh prompt resets exhausted models and can recover", async () => {

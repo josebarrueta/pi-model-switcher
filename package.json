@@ -14,7 +14,8 @@
   "pi": { "extensions": ["./src/index.ts"] },
   "engines": { "node": ">=22.19" },
   "scripts": {
-    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "test": "node --experimental-strip-types --test --test-timeout=15000 test/*.test.ts",
+    "test:ci": "node -e \"require('node:fs').mkdirSync('test-results', { recursive: true })\" && node --experimental-strip-types --test --test-timeout=15000 --test-reporter=spec --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination=test-results/junit.xml test/*.test.ts",
     "check": "tsc --noEmit"
   },
   "peerDependencies": {

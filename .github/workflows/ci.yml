@@ -11,14 +11,34 @@ permissions:
 
 jobs:
   check:
+    name: Validate (Node ${{ matrix.node }})
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['22.19.0', '24']
+    env:
+      PI_OFFLINE: '1'
+      PI_SKIP_VERSION_CHECK: '1'
+      PI_TELEMETRY: '0'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: '22.19.0'
+          node-version: ${{ matrix.node }}
           cache: npm
       - run: npm ci --ignore-scripts
       - run: npm run check
-      - run: npm test
-      - run: npm pack --dry-run
+      - name: Mocked provider integration tests
+        run: npm run test:ci
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-node-${{ matrix.node }}
+          path: test-results/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Validate installable package
+        run: npm pack --dry-run
