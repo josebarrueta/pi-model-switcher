@@ -1,0 +1,30 @@
+{
+  "name": "pi-model-switcher",
+  "version": "0.1.0",
+  "description": "Bounded model failover for pi after rate-limit errors",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/josebarrueta/pi-model-switcher.git"
+  },
+  "homepage": "https://github.com/josebarrueta/pi-model-switcher#readme",
+  "bugs": { "url": "https://github.com/josebarrueta/pi-model-switcher/issues" },
+  "keywords": ["pi-package"],
+  "files": ["src", "README.md"],
+  "pi": { "extensions": ["./src/index.ts"] },
+  "engines": { "node": ">=22.19" },
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "check": "tsc --noEmit"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-ai": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "1.4.0",
+    "@earendil-works/pi-ai": "1.4.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.9.3"
+  }
+}
