@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pi failover — throwaway logic prototype</title>
+<style>
+:root{font-family:system-ui,sans-serif;color:#24312d;background:#f4f6f3;line-height:1.5}body{max-width:1000px;margin:40px auto;padding:0 24px}h1{margin-bottom:8px}h2{font-size:1.15rem}small,.muted{color:#596860}section{background:white;border:1px solid #dce3dd;border-radius:12px;padding:22px;margin:20px 0}button{font:inherit;border:1px solid #becfc5;border-radius:7px;padding:9px 13px;background:white;color:#185e45;cursor:pointer;margin:4px}button:hover,button[aria-selected=true]{background:#e6f3ec}button:disabled{opacity:.45;cursor:default}dl{display:grid;grid-template-columns:180px 1fr;gap:10px}dt{color:#596860}dd{margin:0;overflow-wrap:anywhere}#notice{border-left:4px solid #22835c;padding:10px 14px;background:#edf6ef}label{display:inline-block;margin:5px 18px 5px 0}ol{padding-left:24px}code{font-size:.9em}.badge{color:#185e45;font-size:.8rem;font-weight:700;text-transform:uppercase} @media(max-width:600px){dl{grid-template-columns:1fr;gap:4px}dd{margin-bottom:10px}}
+</style>
+<body>
+<div class="badge">Throwaway prototype · simulated responses only</div>
+<h1>Keep working when a model is rate-limited</h1>
+<p>Question: can Pi continue the same task after a 429 by trying each available model at most once, without looping when every model is unavailable?</p>
+<p class="muted">Assumptions: start on Codex, prefer a different provider after a 429, exclude rate-limited models until a new task, and keep the working model after success. Other errors and cancellation stop immediately. Completed tool work is preserved, not replayed. No API calls, credentials, storage, or real tool execution.</p>
+<section aria-live="polite">
+<h2>Current task</h2><p id="notice"></p><dl id="state"></dl>
+<h3>Task history</h3><ol id="history"></ol>
+</section>
+<section>
+<h2>Free play</h2>
+<p>Choose the models available for the next task. These are illustrative model identities, not a scan of your Pi configuration.</p>
+<div id="availability"></div>
+<div id="actions"></div>
+</section>
+<section>
+<h2>Guided walkthroughs</h2>
+<p class="muted">Selecting a walkthrough resets the task and availability. Each step performs a real action in the simulation.</p>
+<div id="tabs" role="tablist" aria-label="Scenarios"></div>
+<p id="description"></p><div id="steps"></div>
+</section>
+<script>
+// Portable state model: no DOM, I/O, timers, or persistence.
+const models = [
+  {id:'codex', label:'OpenAI Codex · primary', provider:'openai-codex'},
+  {id:'codex-alt', label:'OpenAI Codex · alternate', provider:'openai-codex'},
+  {id:'claude', label:'Anthropic Claude', provider:'anthropic'}
+];
+function startTask(available) {
+  const unique = models.filter(m => available.includes(m.id)).map(m => m.id);
+  const current = unique[0] ?? null;
+  return {available:unique,current,attempted:current?[current]:[],limited:[],phase:current?'working':'stopped',completedTools:0,requests:current?1:0,history:[current?'Task started; sending the first request.':'Stopped: no models with configured credentials.'],notice:current?'Waiting for the current model response.':'No available models. Configure credentials before starting another task.'};
+}
+function transition(state, action) {
+  if(state.phase !== 'working') return {...state,notice:'This task has ended. Start a new task to make another request.'};
+  const next = {...state,attempted:[...state.attempted],limited:[...state.limited],history:[...state.history]};
+  const label = models.find(m=>m.id===state.current).label;
+  function note(text){next.notice=text;next.history.push(text);return next;}
+  if(action==='cancel'){next.phase='cancelled';return note('Cancelled by you. No more requests.');}
+  if(action==='error'){next.phase='stopped';return note(label+' returned a non-429 error. Stopped; no automatic failover.');}
+  if(action==='success'){next.phase='done';return note(label+' completed the task.');}
+  if(action==='tool'){
+    next.completedTools++; next.requests++;
+    return note(label+' completed a tool action; continuing on the same model. Previous work stays completed.');
+  }
+  if(action==='429'){
+    next.limited.push(state.current);
+    const remaining = models.filter(m=>state.available.includes(m.id)&&!next.limited.includes(m.id));
+    const provider = models.find(m=>m.id===state.current).provider;
+    const candidate = remaining.find(m=>m.provider!==provider) ?? remaining[0];
+    if(!candidate){next.phase='stopped';return note('All available models returned 429. Work stopped; no cycling or background retries.');}
+    next.current=candidate.id;next.attempted.push(candidate.id);next.requests++;
+    return note(label+' returned 429. Continuing the same task with '+candidate.label+'.');
+  }
+  return state;
+}
+</script>
+<script>
+// Throwaway presentation shell.
+let state = startTask(models.map(m=>m.id));
+let selectedScenario = -1, step = 0;
+const labels={tool:'Model completes a tool action', '429':'Model returns 429', success:'Model finishes the task',error:'Model returns another error',cancel:'Cancel work'};
+const scenarios=[
+ {name:'Codex → Claude',description:'Codex is rate-limited. Claude continues the task and finishes it.',available:['codex','codex-alt','claude'],actions:['429','success']},
+ {name:'Every model fails',description:'Try a different provider first, then the remaining Codex model. The third 429 must stop the task, not return to the first model.',available:['codex','codex-alt','claude'],actions:['429','429','429','429']},
+ {name:'Work already completed',description:'A tool action has already completed before the next request gets a 429. Switching models preserves that work; the simulation does not replay it.',available:['codex','claude'],actions:['tool','429','tool','success']},
+ {name:'Only one model',description:'Without another configured model, one 429 must stop the task immediately.',available:['codex'],actions:['429','429']},
+ {name:'Cancellation wins',description:'After switching, cancellation ends the task. A late failure must not start another request.',available:['codex','codex-alt','claude'],actions:['429','cancel','429']},
+ {name:'Not a rate limit',description:'An authentication, network, or other non-429 failure does not trigger this policy.',available:['codex','claude'],actions:['error','429']},
+ {name:'No credentials',description:'No eligible models means no requests and an immediate stop.',available:[],actions:['429']}
+];
+const $=id=>document.getElementById(id);
+function element(tag,text){const e=document.createElement(tag);e.textContent=text;return e;}
+function checkedModels(){return [...$('availability').querySelectorAll('input:checked')].map(e=>e.value);}
+function setAvailability(ids){$('availability').querySelectorAll('input').forEach(e=>e.checked=ids.includes(e.value));}
+function act(action){state=transition(state,action);render();}
+models.forEach(m=>{const label=element('label','');const input=document.createElement('input');input.type='checkbox';input.value=m.id;input.checked=true;label.append(input,document.createTextNode(' '+m.label));$('availability').append(label);});
+Object.entries(labels).forEach(([action,label])=>{const b=element('button',label);b.onclick=()=>act(action);$('actions').append(b);});
+const restart=element('button','Start a new task');restart.onclick=()=>{selectedScenario=-1;step=0;state=startTask(checkedModels());render();};$('actions').prepend(restart);
+scenarios.forEach((scenario,i)=>{const b=element('button',scenario.name);b.setAttribute('role','tab');b.onclick=()=>{selectedScenario=i;step=0;setAvailability(scenario.available);state=startTask(scenario.available);render();};$('tabs').append(b);});
+function render(){
+ $('notice').textContent=state.notice;
+ const name=id=>models.find(m=>m.id===id)?.label ?? 'None';
+ const list=ids=>ids.length?ids.map(name).join(' → '):'None';
+ const fields=[['Status',state.phase],['Current / last model',name(state.current)],['Eligible models',list(state.available)],['Attempt order',list(state.attempted)],['Rate-limited models',list(state.limited)],['Model requests sent',String(state.requests)],['Completed tool actions',String(state.completedTools)],['Task context','Same conversation; completed work retained'],['Pending automatic retry','None — only a simulated 429 sends the next model request']];
+ $('state').replaceChildren(...fields.flatMap(([k,v])=>[element('dt',k),element('dd',v)]));
+ $('history').replaceChildren(...state.history.map(t=>element('li',t)));
+ [...$('tabs').children].forEach((b,i)=>b.setAttribute('aria-selected',String(i===selectedScenario)));
+ $('steps').replaceChildren();
+ if(selectedScenario<0){$('description').textContent='Select a scenario, or explore the buttons above.';return;}
+ const scenario=scenarios[selectedScenario];$('description').textContent=scenario.description;
+ scenario.actions.forEach((action,i)=>{const b=element('button',`${i+1}. ${labels[action]}${i<step?' ✓':''}`);b.disabled=i!==step;b.onclick=()=>{step++;act(action);};$('steps').append(b);});
+ if(step===scenario.actions.length)$('steps').append(element('p','Walkthrough complete. Compare the final state with your expectations.'));
+}
+render();
+</script>
+</body>
+</html>
